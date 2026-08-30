@@ -5,7 +5,7 @@ import os
 import time
 
 import config
-from utils import format_size, get_local_ip
+from utils import format_size, format_time, get_local_ip
 
 class Sender:
     """
@@ -184,24 +184,32 @@ class Sender:
                                     avg_bytes_sec = total_sent_bytes / total_elapsed if total_elapsed > 0 else 0
                                     peak_bytes_sec = max(peak_bytes_sec, cur_bytes_sec)
 
+                                    remaining_bytes = max(0, total_bytes - total_sent_bytes)
+                                    eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
+                                    eta_str = format_time(eta_sec)
+                                    elapsed_str = format_time(total_elapsed)
+
                                     cur_speed_str = f"{format_size(cur_bytes_sec)}/s"
                                     avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
                                     peak_speed_str = f"{format_size(peak_bytes_sec)}/s"
                                     size_info_str = f"{format_size(total_sent_bytes)} / {format_size(total_bytes)}"
 
-                                    self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str)
+                                    self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
                                     last_update_time = current_time
                                     last_sent_bytes = total_sent_bytes
 
                 if self.running:
                     total_elapsed = max(time.time() - start_time, 0.001)
                     final_avg = (total_sent_bytes / total_elapsed) if total_elapsed > 0 else 0
+                    elapsed_str = format_time(total_elapsed)
                     self.on_progress(
                         100.0, 
                         "Done", 
                         f"{format_size(final_avg)}/s", 
                         f"{format_size(peak_bytes_sec)}/s", 
-                        f"{format_size(total_sent_bytes)} / {format_size(total_bytes)}"
+                        f"{format_size(total_sent_bytes)} / {format_size(total_bytes)}",
+                        "0s",
+                        elapsed_str
                     )
                     self.on_status("Folder transfer complete!")
                     self.on_complete(True)
@@ -250,27 +258,33 @@ class Sender:
                             avg_bytes_sec = sent_bytes / total_elapsed if total_elapsed > 0 else 0
                             peak_bytes_sec = max(peak_bytes_sec, cur_bytes_sec)
 
+                            remaining_bytes = max(0, file_size - sent_bytes)
+                            eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
+                            eta_str = format_time(eta_sec)
+                            elapsed_str = format_time(total_elapsed)
+
                             cur_speed_str = f"{format_size(cur_bytes_sec)}/s"
                             avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
                             peak_speed_str = f"{format_size(peak_bytes_sec)}/s"
                             size_info_str = f"{format_size(sent_bytes)} / {format_size(file_size)}"
 
-                            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str)
+                            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
                             last_update_time = current_time
                             last_sent_bytes = sent_bytes
 
                 if sent_bytes == file_size:
                     total_elapsed = max(time.time() - start_time, 0.001)
                     final_avg = (sent_bytes / total_elapsed) if total_elapsed > 0 else 0
+                    elapsed_str = format_time(total_elapsed)
                     self.on_progress(
                         100.0, 
                         "Done", 
                         f"{format_size(final_avg)}/s", 
                         f"{format_size(peak_bytes_sec)}/s", 
-                        f"{format_size(sent_bytes)} / {format_size(file_size)}"
+                        f"{format_size(sent_bytes)} / {format_size(file_size)}",
+                        "0s",
+                        elapsed_str
                     )
-                    self.on_status("Transfer complete!")
-                    self.on_complete(True)
                     self.on_status("Transfer complete!")
                     self.on_complete(True)
                 else:

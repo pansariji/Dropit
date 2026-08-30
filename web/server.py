@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 
 import config
-from utils import get_local_ip, format_size
+from utils import get_local_ip, format_size, format_time
 from web.templates import MOBILE_UPLOAD_HTML_PAGE, MOBILE_DOWNLOAD_HTML_PAGE
 
 class DropItHTTPHandler(http.server.BaseHTTPRequestHandler):
@@ -233,7 +233,13 @@ class WebReceiver:
             avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
             peak_speed_str = f"{format_size(self._peak_bytes_sec)}/s"
             size_info_str = f"{format_size(received)} / {format_size(total)}"
-            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str)
+
+            remaining_bytes = max(0, total - received)
+            eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
+            eta_str = format_time(eta_sec)
+            elapsed_str = format_time(total_elapsed)
+
+            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
         if self.on_status:
             self.on_status(f"Receiving {rel_path} ({format_size(received)} / {format_size(total)})")
 
@@ -247,7 +253,8 @@ class WebReceiver:
             final_avg = rec / total_elapsed if total_elapsed > 0 else 0
             peak_str = f"{format_size(getattr(self, '_peak_bytes_sec', 0.0))}/s"
             size_str = f"{format_size(rec)} / {format_size(tot)}" if tot > 0 else "--"
-            self.on_progress(100.0, "Done", f"{format_size(final_avg)}/s", peak_str, size_str)
+            elapsed_str = format_time(total_elapsed)
+            self.on_progress(100.0, "Done", f"{format_size(final_avg)}/s", peak_str, size_str, "0s", elapsed_str)
         if self.on_status:
             self.on_status(f"Saved: {os.path.basename(filepath)}")
         if self.on_complete:
@@ -369,7 +376,13 @@ class WebSender:
             avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
             peak_speed_str = f"{format_size(self._peak_bytes_sec)}/s"
             size_info_str = f"{format_size(sent)} / {format_size(total)}"
-            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str)
+
+            remaining_bytes = max(0, total - sent)
+            eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
+            eta_str = format_time(eta_sec)
+            elapsed_str = format_time(total_elapsed)
+
+            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
         if self.on_status:
             self.on_status(f"Sending {self.target_filename} ({format_size(sent)} / {format_size(total)})")
 
@@ -382,10 +395,10 @@ class WebSender:
             final_avg = sent / total_elapsed if total_elapsed > 0 else 0
             peak_str = f"{format_size(getattr(self, '_peak_bytes_sec', 0.0))}/s"
             size_str = f"{format_size(sent)} / {format_size(self.file_size)}"
-            self.on_progress(100.0, "Done", f"{format_size(final_avg)}/s", peak_str, size_str)
+            elapsed_str = format_time(total_elapsed)
+            self.on_progress(100.0, "Done", f"{format_size(final_avg)}/s", peak_str, size_str, "0s", elapsed_str)
         if self.on_status:
             self.on_status("Transfer complete!" if success else "Transfer failed.")
         if self.on_complete:
-            self.on_complete(success)
             self.on_complete(success)
 

@@ -1,5 +1,5 @@
-from ui.home_frame import HomeFrame
-from ui.receive_frame import ReceiveFrame
-from ui.send_frame import SendFrame
+from ui.home_view import HomeView
+from ui.receive_view import ReceiveView
+from ui.send_view import SendView
 
-__all__ = ['HomeFrame', 'ReceiveFrame', 'SendFrame']
+__all__ = ['HomeView', 'ReceiveView', 'SendView']
