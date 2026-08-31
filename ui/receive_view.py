@@ -1,5 +1,6 @@
 import flet as ft
 import os
+import time
 import subprocess
 import config
 from utils import get_local_ip, generate_passcode, generate_qr_image, pil_to_b64
@@ -42,6 +43,68 @@ class ReceiveView(ft.Container):
         self.size_info_val = "--"
         self.eta_val = "--"
         self.elapsed_val = "--"
+
+        # UI state and rate-limiting
+        self._last_ui_update = 0.0
+        self._rendered_metrics_state = None
+
+        # Persistent UI controls for metrics dashboard
+        tokens = self.tokens
+        self.pbar = ft.ProgressBar(
+            value=0.0,
+            color=tokens["green"],
+            bgcolor=tokens["card_alt"],
+            height=8
+        )
+        self.percent_text = ft.Text(
+            "0.0%",
+            size=14,
+            weight=ft.FontWeight.BOLD,
+            color=tokens["text"]
+        )
+        self.status_text = ft.Text(
+            self.status_text_val,
+            size=12,
+            weight=ft.FontWeight.W_500,
+            color=tokens["muted"],
+            overflow=ft.TextOverflow.ELLIPSIS
+        )
+        self.lbl_size = ft.Text("Size", size=10, weight=ft.FontWeight.W_600, color=tokens["muted"])
+        self.val_size = ft.Text("--", size=12, weight=ft.FontWeight.BOLD, color=tokens["text"])
+        self.lbl_speed = ft.Text("Speed", size=10, weight=ft.FontWeight.W_600, color=tokens["muted"])
+        self.val_speed = ft.Text("--", size=12, weight=ft.FontWeight.BOLD, color=tokens["text"])
+        self.lbl_peak = ft.Text("Peak", size=10, weight=ft.FontWeight.W_600, color=tokens["muted"])
+        self.val_peak = ft.Text("--", size=12, weight=ft.FontWeight.BOLD, color=tokens["text"])
+        self.lbl_time = ft.Text("ETA", size=10, weight=ft.FontWeight.W_600, color=tokens["muted"])
+        self.val_time = ft.Text("--", size=12, weight=ft.FontWeight.BOLD, color=tokens["text"])
+
+        self.tile_size = ft.Column(controls=[self.lbl_size, self.val_size], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2)
+        self.tile_speed = ft.Column(controls=[self.lbl_speed, self.val_speed], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2)
+        self.tile_peak = ft.Column(controls=[self.lbl_peak, self.val_peak], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2)
+        self.tile_time = ft.Column(controls=[self.lbl_time, self.val_time], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2)
+        self.metrics_grid_row = ft.Row(
+            controls=[self.tile_size, self.tile_speed, self.tile_peak, self.tile_time],
+            alignment=ft.MainAxisAlignment.SPACE_AROUND
+        )
+
+        self.show_file_btn = ft.ElevatedButton(
+            content=ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.FOLDER_OPEN_ROUNDED, size=18, color=tokens["btn_primary_fg"]),
+                    ft.Text("Show Received File", size=13, weight=ft.FontWeight.BOLD, color=tokens["btn_primary_fg"])
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=6
+            ),
+            style=ft.ButtonStyle(
+                color=tokens["btn_primary_fg"],
+                bgcolor=tokens["btn_primary_bg"],
+                shape=ft.RoundedRectangleBorder(radius=10),
+                padding=ft.Padding(left=0, top=12, right=0, bottom=12)
+            ),
+            on_click=self.open_received_file,
+            expand=True
+        )
 
         self.build_ui()
         self.start_mode_server()
@@ -239,134 +302,80 @@ class ReceiveView(ft.Container):
     def update_metrics_ui(self):
         tokens = self.tokens
 
-        # Progress Bar & Percentage
-        pbar = ft.ProgressBar(
-            value=self.progress_percent / 100.0,
-            color=tokens["green"],
-            bgcolor=tokens["card_alt"],
-            height=8
-        )
-
-        percent_text = ft.Text(
-            f"{self.progress_percent:.1f}%",
-            size=14,
-            weight=ft.FontWeight.BOLD,
-            color=tokens["text"]
-        )
-
-        status_text = ft.Text(
-            self.status_text_val,
-            size=12,
-            weight=ft.FontWeight.W_500,
-            color=tokens["muted"],
-            overflow=ft.TextOverflow.ELLIPSIS
-        )
+        # In-place property mutation of persistent controls
+        self.pbar.value = max(0.0, min(1.0, self.progress_percent / 100.0))
+        self.percent_text.value = f"{self.progress_percent:.1f}%"
+        self.status_text.value = self.status_text_val
+        self.val_size.value = self.size_info_val
+        self.val_peak.value = self.peak_speed_val
 
         if self.transfer_state == "completed":
-            # Transfer Completion Card
-            show_file_btn = ft.ElevatedButton(
-                content=ft.Row(
+            self.lbl_speed.value = "Avg Speed"
+            self.val_speed.value = self.avg_speed_val
+            self.lbl_time.value = "Time Taken"
+            self.val_time.value = self.elapsed_val
+        else:
+            self.lbl_speed.value = "Speed"
+            self.val_speed.value = self.cur_speed_val
+            self.lbl_time.value = "ETA"
+            self.val_time.value = self.eta_val
+
+        # Only update metric container hierarchy when layout state changes
+        if self._rendered_metrics_state != self.transfer_state:
+            self._rendered_metrics_state = self.transfer_state
+
+            if self.transfer_state == "completed":
+                self.metrics_container.content = ft.Column(
                     controls=[
-                        ft.Icon(ft.Icons.FOLDER_OPEN_ROUNDED, size=18, color=tokens["btn_primary_fg"]),
-                        ft.Text("Show Received File", size=13, weight=ft.FontWeight.BOLD, color=tokens["btn_primary_fg"])
+                        ft.Row(
+                            controls=[
+                                ft.Icon(ft.Icons.CHECK_CIRCLE_ROUNDED, color=tokens["green"], size=22),
+                                ft.Text("Transfer Completed!", size=15, weight=ft.FontWeight.BOLD, color=tokens["green"])
+                            ],
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            spacing=8
+                        ),
+                        ft.Container(height=4),
+                        self.pbar,
+                        ft.Container(height=8),
+                        self.metrics_grid_row,
+                        ft.Container(height=12),
+                        self.show_file_btn
                     ],
                     alignment=ft.MainAxisAlignment.CENTER,
-                    spacing=6
-                ),
-                style=ft.ButtonStyle(
-                    color=tokens["btn_primary_fg"],
-                    bgcolor=tokens["btn_primary_bg"],
-                    shape=ft.RoundedRectangleBorder(radius=10),
-                    padding=ft.Padding(left=0, top=12, right=0, bottom=12)
-                ),
-                on_click=self.open_received_file,
-                expand=True
-            )
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=4
+                )
 
-            metrics_grid = ft.Row(
-                controls=[
-                    self._build_metric_tile("Size", self.size_info_val),
-                    self._build_metric_tile("Avg Speed", self.avg_speed_val),
-                    self._build_metric_tile("Peak Speed", self.peak_speed_val),
-                    self._build_metric_tile("Time Taken", self.elapsed_val),
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_AROUND
-            )
-
-            self.metrics_container.content = ft.Column(
-                controls=[
-                    ft.Row(
-                        controls=[
-                            ft.Icon(ft.Icons.CHECK_CIRCLE_ROUNDED, color=tokens["green"], size=22),
-                            ft.Text("Transfer Completed!", size=15, weight=ft.FontWeight.BOLD, color=tokens["green"])
-                        ],
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        spacing=8
-                    ),
-                    ft.Container(height=4),
-                    pbar,
-                    ft.Container(height=8),
-                    metrics_grid,
-                    ft.Container(height=12),
-                    show_file_btn
-                ],
-                alignment=ft.MainAxisAlignment.CENTER,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=4
-            )
-
-        elif self.transfer_state == "transferring":
-            # Active Transfer Metrics Dashboard
-            metrics_grid = ft.Row(
-                controls=[
-                    self._build_metric_tile("Size", self.size_info_val),
-                    self._build_metric_tile("Speed", self.cur_speed_val),
-                    self._build_metric_tile("Peak", self.peak_speed_val),
-                    self._build_metric_tile("ETA", self.eta_val),
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_AROUND
-            )
-
-            self.metrics_container.content = ft.Column(
-                controls=[
-                    ft.Row(
-                        controls=[status_text, percent_text],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN
-                    ),
-                    ft.Container(height=4),
-                    pbar,
-                    ft.Container(height=10),
-                    metrics_grid
-                ],
-                alignment=ft.MainAxisAlignment.CENTER,
-                spacing=4
-            )
-        else:
-            # Idle / Waiting state
-            self.metrics_container.content = ft.Column(
-                controls=[
-                    ft.Row(
-                        controls=[
-                            ft.ProgressRing(width=16, height=16, stroke_width=2, color=tokens["green"]),
-                            ft.Text("Ready to receive files...", size=13, weight=ft.FontWeight.W_500, color=tokens["muted"])
-                        ],
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        spacing=10
-                    )
-                ],
-                alignment=ft.MainAxisAlignment.CENTER
-            )
-
-    def _build_metric_tile(self, label, value):
-        tokens = self.tokens
-        return ft.Column(
-            controls=[
-                ft.Text(label, size=10, weight=ft.FontWeight.W_600, color=tokens["muted"]),
-                ft.Text(value, size=12, weight=ft.FontWeight.BOLD, color=tokens["text"])
-            ],
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=2
-        )
+            elif self.transfer_state == "transferring":
+                self.metrics_container.content = ft.Column(
+                    controls=[
+                        ft.Row(
+                            controls=[self.status_text, self.percent_text],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN
+                        ),
+                        ft.Container(height=4),
+                        self.pbar,
+                        ft.Container(height=10),
+                        self.metrics_grid_row
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=4
+                )
+            else:
+                self.metrics_container.content = ft.Column(
+                    controls=[
+                        ft.Row(
+                            controls=[
+                                ft.ProgressRing(width=16, height=16, stroke_width=2, color=tokens["green"]),
+                                ft.Text("Ready to receive files...", size=13, weight=ft.FontWeight.W_500, color=tokens["muted"])
+                            ],
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            spacing=10
+                        )
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER
+                )
 
     def switch_mode(self, mode):
         if self.active_mode == mode:
@@ -416,7 +425,8 @@ class ReceiveView(ft.Container):
             pass
 
     def on_progress(self, percent, cur_speed, avg_speed, peak_speed, size_info, eta_str="--", elapsed_str="--"):
-        self.transfer_state = "completed" if percent >= 100.0 else "transferring"
+        is_completed = percent >= 100.0
+        self.transfer_state = "completed" if is_completed else "transferring"
         self.progress_percent = percent
         self.cur_speed_val = cur_speed
         self.avg_speed_val = avg_speed
@@ -424,6 +434,13 @@ class ReceiveView(ft.Container):
         self.size_info_val = size_info
         self.eta_val = eta_str
         self.elapsed_val = elapsed_str
+
+        # Throttle page updates to max once per ~120ms during active transfer (always update on completion)
+        now = time.time()
+        if not is_completed and (now - self._last_ui_update < 0.12):
+            return
+        self._last_ui_update = now
+
         try:
             self.update_metrics_ui()
             self.page_ref.update()
