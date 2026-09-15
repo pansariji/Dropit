@@ -21,10 +21,10 @@ jobs:
             asset_path: dist/DropIt.exe
           - os: macos-latest
             artifact_name: DropIt-macOS
-            asset_path: dist/DropIt
+            asset_path: dist/DropIt-macOS
           - os: ubuntu-latest
             artifact_name: DropIt-Linux
-            asset_path: dist/DropIt
+            asset_path: dist/DropIt-Linux
 
     steps:
     - name: Checkout Code
@@ -55,7 +55,7 @@ jobs:
     - name: Build Executable with PyInstaller (macOS / Linux)
       if: runner.os != 'Windows'
       run: |
-        python -m PyInstaller --noconfirm --onefile --windowed --add-data "assets:assets" --name DropIt main.py
+        python -m PyInstaller --noconfirm --onefile --windowed --add-data "assets:assets" --name ${{ matrix.artifact_name }} main.py
 
     - name: Upload Executable Artifact
       uses: actions/upload-artifact@v4
