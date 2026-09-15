@@ -21,7 +21,7 @@ jobs:
             asset_path: dist/DropIt.exe
           - os: macos-latest
             artifact_name: DropIt-macOS
-            asset_path: dist/DropIt-macOS
+            asset_path: dist/DropIt-macOS.zip
           - os: ubuntu-latest
             artifact_name: DropIt-Linux
             asset_path: dist/DropIt-Linux
@@ -56,6 +56,12 @@ jobs:
       if: runner.os != 'Windows'
       run: |
         python -m PyInstaller --noconfirm --onefile --windowed --add-data "assets:assets" --name ${{ matrix.artifact_name }} main.py
+
+    - name: Zip macOS App Bundle
+      if: runner.os == 'macOS'
+      run: |
+        cd dist
+        zip -r ${{ matrix.artifact_name }}.zip ${{ matrix.artifact_name }}.app
 
     - name: Upload Executable Artifact
       uses: actions/upload-artifact@v4
