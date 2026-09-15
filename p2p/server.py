@@ -5,7 +5,7 @@ import os
 import time
 
 import config
-from utils import get_local_ip, format_size, format_time
+from utils import get_local_ip, format_size, TransferMetricsTracker, optimize_tcp_socket
 
 class Receiver:
     """
@@ -23,6 +23,8 @@ class Receiver:
         self.local_ip = get_local_ip()
         
         self.running = False
+        self.pause_event = threading.Event()
+        self.pause_event.set()
         self.tcp_server_socket = None
         self.udp_socket = None
         self.tcp_port = 0
@@ -31,11 +33,25 @@ class Receiver:
         if not os.path.exists(self.downloads_dir):
             os.makedirs(self.downloads_dir)
 
+    def pause(self):
+        """Pauses the active receiving loop."""
+        self.pause_event.clear()
+        if hasattr(self, 'tracker') and self.tracker:
+            self.tracker.pause()
+
+    def resume(self):
+        """Resumes the active receiving loop."""
+        self.pause_event.set()
+        if hasattr(self, 'tracker') and self.tracker:
+            self.tracker.resume()
+
     def start(self):
         """Binds the TCP listener and starts background threads for UDP and TCP socket handling."""
         self.running = True
+        self.pause_event.set()
         
         self.tcp_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        optimize_tcp_socket(self.tcp_server_socket)
         port = config.DEFAULT_P2P_PORT
         while self.running:
             try:
@@ -56,6 +72,7 @@ class Receiver:
     def stop(self):
         """Stops active listeners and releases bound socket resources."""
         self.running = False
+        self.pause_event.set()
         if self.tcp_server_socket:
             try:
                 self.tcp_server_socket.close()
@@ -72,6 +89,11 @@ class Receiver:
         try:
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except Exception:
+                    pass
             self.udp_socket.bind(('0.0.0.0', self.udp_port))
             
             while self.running:
@@ -95,7 +117,7 @@ class Receiver:
                 client_sock, addr = self.tcp_server_socket.accept()
                 if not self.running:
                     break
-                
+                optimize_tcp_socket(client_sock)
                 self.on_status(f"Connected by {addr[0]}")
                 threading.Thread(target=self._handle_client, args=(client_sock,), daemon=True).start()
         except Exception as e:
@@ -130,10 +152,9 @@ class Receiver:
                 os.makedirs(dest_folder, exist_ok=True)
 
                 total_received_bytes = 0
-                start_time = time.time()
-                last_update_time = start_time
-                last_received_bytes = 0
-                peak_bytes_sec = 0.0
+                tracker = TransferMetricsTracker()
+                self.tracker = tracker
+                last_ui_update = 0.0
 
                 for _ in range(entry_count):
                     if not self.running:
@@ -164,8 +185,12 @@ class Receiver:
                         fsize = struct.unpack('>Q', raw_fsize)[0]
 
                         received_file_bytes = 0
-                        with open(target_path, 'wb') as f:
+                        with open(target_path, 'wb', buffering=config.DISK_BUFFER_SIZE) as f:
                             while received_file_bytes < fsize and self.running:
+                                if not self.pause_event.wait(timeout=0.2):
+                                    continue
+                                if not self.running:
+                                    break
                                 chunk_size = min(config.CHUNK_SIZE_P2P, fsize - received_file_bytes)
                                 chunk = client_sock.recv(chunk_size)
                                 if not chunk:
@@ -176,47 +201,34 @@ class Receiver:
                                 total_received_bytes += len_chunk
 
                                 current_time = time.time()
-                                if current_time - last_update_time > 0.1:
-                                    percent = (total_received_bytes / total_size * 100) if total_size > 0 else 100.0
-                                    elapsed_interval = current_time - last_update_time
-                                    total_elapsed = max(current_time - start_time, 0.001)
+                                if current_time - last_ui_update > 0.1:
+                                    metrics = tracker.update(total_received_bytes, total_size)
+                                    self.on_progress(
+                                        metrics["percent"],
+                                        metrics["cur_speed_str"],
+                                        metrics["avg_speed_str"],
+                                        metrics["peak_speed_str"],
+                                        metrics["size_info_str"],
+                                        metrics["eta_str"],
+                                        metrics["elapsed_str"]
+                                    )
+                                    last_ui_update = current_time
 
-                                    bytes_diff = total_received_bytes - last_received_bytes
-                                    cur_bytes_sec = bytes_diff / elapsed_interval if elapsed_interval > 0 else 0
-                                    avg_bytes_sec = total_received_bytes / total_elapsed if total_elapsed > 0 else 0
-                                    peak_bytes_sec = max(peak_bytes_sec, cur_bytes_sec)
-
-                                    remaining_bytes = max(0, total_size - total_received_bytes)
-                                    eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
-                                    eta_str = format_time(eta_sec)
-                                    elapsed_str = format_time(total_elapsed)
-
-                                    cur_speed_str = f"{format_size(cur_bytes_sec)}/s"
-                                    avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
-                                    peak_speed_str = f"{format_size(peak_bytes_sec)}/s"
-                                    size_info_str = f"{format_size(total_received_bytes)} / {format_size(total_size)}"
-
-                                    self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
-                                    last_update_time = current_time
-                                    last_received_bytes = total_received_bytes
-
-                if self.running:
-                    total_elapsed = max(time.time() - start_time, 0.001)
-                    final_avg = (total_received_bytes / total_elapsed) if total_elapsed > 0 else 0
-                    elapsed_str = format_time(total_elapsed)
+                if total_received_bytes == total_size and self.running:
+                    final_m = tracker.get_final_metrics(total_size)
                     self.on_progress(
-                        100.0, 
-                        "Done", 
-                        f"{format_size(final_avg)}/s", 
-                        f"{format_size(peak_bytes_sec)}/s", 
-                        f"{format_size(total_received_bytes)} / {format_size(total_size)}",
-                        "0s",
-                        elapsed_str
+                        final_m["percent"], 
+                        final_m["cur_speed_str"], 
+                        final_m["avg_speed_str"], 
+                        final_m["peak_speed_str"], 
+                        final_m["size_info_str"],
+                        final_m["eta_str"],
+                        final_m["elapsed_str"]
                     )
                     self.on_status(f"Folder transfer complete. Saved to Downloads/{foldername}")
                     self.on_complete(True, dest_folder)
                 else:
-                    self.on_status("Transfer interrupted.")
+                    self.on_status("Transfer incomplete or interrupted.")
                     self.on_complete(False, None)
 
             elif flag == 'F':
@@ -230,18 +242,21 @@ class Receiver:
                 raw_filesize = self._recvall(client_sock, 8)
                 file_size = struct.unpack('>Q', raw_filesize)[0]
 
-                self.on_status(f"Receiving file: {filename} ({format_size(file_size)})")
+                self.on_status(f"Receiving payload: {filename} ({format_size(file_size)})")
 
                 filepath = os.path.join(self.downloads_dir, filename)
                 received_bytes = 0
 
-                start_time = time.time()
-                last_update_time = start_time
-                last_received_bytes = 0
-                peak_bytes_sec = 0.0
+                tracker = TransferMetricsTracker()
+                self.tracker = tracker
+                last_ui_update = 0.0
 
-                with open(filepath, 'wb') as f:
+                with open(filepath, 'wb', buffering=config.DISK_BUFFER_SIZE) as f:
                     while received_bytes < file_size and self.running:
+                        if not self.pause_event.wait(timeout=0.2):
+                            continue
+                        if not self.running:
+                            break
                         chunk_size = min(config.CHUNK_SIZE_P2P, file_size - received_bytes)
                         chunk = client_sock.recv(chunk_size)
                         if not chunk:
@@ -250,44 +265,31 @@ class Receiver:
                         received_bytes += len(chunk)
 
                         current_time = time.time()
-                        if current_time - last_update_time > 0.1:
-                            percent = (received_bytes / file_size * 100) if file_size > 0 else 100.0
-                            elapsed_interval = current_time - last_update_time
-                            total_elapsed = max(current_time - start_time, 0.001)
+                        if current_time - last_ui_update > 0.1:
+                            metrics = tracker.update(received_bytes, file_size)
+                            self.on_progress(
+                                metrics["percent"],
+                                metrics["cur_speed_str"],
+                                metrics["avg_speed_str"],
+                                metrics["peak_speed_str"],
+                                metrics["size_info_str"],
+                                metrics["eta_str"],
+                                metrics["elapsed_str"]
+                            )
+                            last_ui_update = current_time
 
-                            bytes_diff = received_bytes - last_received_bytes
-                            cur_bytes_sec = bytes_diff / elapsed_interval if elapsed_interval > 0 else 0
-                            avg_bytes_sec = received_bytes / total_elapsed if total_elapsed > 0 else 0
-                            peak_bytes_sec = max(peak_bytes_sec, cur_bytes_sec)
-
-                            remaining_bytes = max(0, file_size - received_bytes)
-                            eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
-                            eta_str = format_time(eta_sec)
-                            elapsed_str = format_time(total_elapsed)
-
-                            cur_speed_str = f"{format_size(cur_bytes_sec)}/s"
-                            avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
-                            peak_speed_str = f"{format_size(peak_bytes_sec)}/s"
-                            size_info_str = f"{format_size(received_bytes)} / {format_size(file_size)}"
-
-                            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
-                            last_update_time = current_time
-                            last_received_bytes = received_bytes
-
-                if received_bytes == file_size:
-                    total_elapsed = max(time.time() - start_time, 0.001)
-                    final_avg = (received_bytes / total_elapsed) if total_elapsed > 0 else 0
-                    elapsed_str = format_time(total_elapsed)
+                if received_bytes == file_size and self.running:
+                    final_m = tracker.get_final_metrics(file_size)
                     self.on_progress(
-                        100.0, 
-                        "Done", 
-                        f"{format_size(final_avg)}/s", 
-                        f"{format_size(peak_bytes_sec)}/s", 
-                        f"{format_size(received_bytes)} / {format_size(file_size)}",
-                        "0s",
-                        elapsed_str
+                        final_m["percent"], 
+                        final_m["cur_speed_str"], 
+                        final_m["avg_speed_str"], 
+                        final_m["peak_speed_str"], 
+                        final_m["size_info_str"],
+                        final_m["eta_str"],
+                        final_m["elapsed_str"]
                     )
-                    self.on_status("Transfer complete. Saved to Downloads folder.")
+                    self.on_status("Payload transfer complete. Saved to Downloads folder.")
                     self.on_complete(True, filepath)
                 else:
                     self.on_status("Transfer incomplete or interrupted.")
@@ -300,7 +302,10 @@ class Receiver:
             self.on_status(f"Transfer error: {e}")
             self.on_complete(False, None)
         finally:
-            client_sock.close()
+            try:
+                client_sock.close()
+            except Exception:
+                pass
 
     def _recvall(self, sock, n):
         """Ensures exact reception of n bytes from the TCP stream before proceeding."""

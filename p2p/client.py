@@ -5,7 +5,7 @@ import os
 import time
 
 import config
-from utils import format_size, format_time, get_local_ip
+from utils import format_size, get_local_ip, TransferMetricsTracker, optimize_tcp_socket
 
 class Sender:
     """
@@ -19,10 +19,27 @@ class Sender:
         self.on_complete = on_complete_callback
         self.udp_port = config.DEFAULT_UDP_PORT
         self.running = False
+        self.pause_event = threading.Event()
+        self.pause_event.set()
         
     def cancel(self):
         """Cancels an active or pending transfer operation."""
         self.running = False
+        self.pause_event.set()
+        if hasattr(self, 'tracker') and self.tracker:
+            self.tracker.resume()
+
+    def pause(self):
+        """Pauses the active streaming loop."""
+        self.pause_event.clear()
+        if hasattr(self, 'tracker') and self.tracker:
+            self.tracker.pause()
+
+    def resume(self):
+        """Resumes the active streaming loop."""
+        self.pause_event.set()
+        if hasattr(self, 'tracker') and self.tracker:
+            self.tracker.resume()
 
     def discover_and_send(self, filepath, passcode, target_ip=None):
         """Starts a background thread to discover the receiver and stream payload data."""
@@ -39,6 +56,12 @@ class Sender:
         it bypasses UDP broadcast and connects directly.
         """
         if target_ip:
+            if ":" in target_ip:
+                try:
+                    ip_part, port_part = target_ip.split(":", 1)
+                    return ip_part, int(port_part)
+                except Exception:
+                    pass
             return target_ip, config.DEFAULT_P2P_PORT
 
         self.on_status(f"Searching for passcode {passcode} on local network...")
@@ -57,20 +80,25 @@ class Sender:
                 pass
 
         try:
-            # Broadcast discovery message to global and subnet broadcast addresses
-            udp_socket.sendto(message, ('255.255.255.255', self.udp_port))
-            if local_ip != '127.0.0.1' and '.' in local_ip:
-                parts = local_ip.split('.')
-                subnet_broadcast = '.'.join(parts[:-1]) + '.255'
-                udp_socket.sendto(message, (subnet_broadcast, self.udp_port))
-            
-            data, addr = udp_socket.recvfrom(1024)
-            response = data.decode('utf-8').strip()
-            if response.startswith("DROPIT_ACCEPT:"):
-                tcp_port = int(response.split(":")[1])
-                udp_socket.close()
-                return addr[0], tcp_port
-        except socket.timeout:
+            # Broadcast discovery message to global and subnet broadcast addresses (retries up to 5 times)
+            for attempt in range(5):
+                if not self.running:
+                    break
+                try:
+                    udp_socket.sendto(message, ('255.255.255.255', self.udp_port))
+                    if local_ip != '127.0.0.1' and '.' in local_ip:
+                        parts = local_ip.split('.')
+                        subnet_broadcast = '.'.join(parts[:-1]) + '.255'
+                        udp_socket.sendto(message, (subnet_broadcast, self.udp_port))
+                    
+                    data, addr = udp_socket.recvfrom(1024)
+                    response = data.decode('utf-8').strip()
+                    if response.startswith("DROPIT_ACCEPT:"):
+                        tcp_port = int(response.split(":")[1])
+                        return addr[0], tcp_port
+                except socket.timeout:
+                    continue
+        except Exception:
             pass
         finally:
             try:
@@ -80,13 +108,25 @@ class Sender:
 
         return None, None
 
+    def notify_complete(self, success, details=None):
+        if self.on_complete:
+            try:
+                self.on_complete(success, details)
+            except TypeError:
+                try:
+                    self.on_complete(success)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
     def _discover_and_send_thread(self, filepath, passcode, target_ip=None):
         """Worker thread performing receiver discovery and chunked TCP streaming."""
         receiver_ip, receiver_tcp_port = self._discover_receiver(passcode, target_ip)
         
         if not receiver_ip or not receiver_tcp_port:
             self.on_status("Discovery failed. Network UDP Broadcast may be blocked.")
-            self.on_complete(False, "DISCOVERY_FAILED")
+            self.notify_complete(False, "DISCOVERY_FAILED")
             return
 
         self.on_status(f"Receiver found at {receiver_ip}. Connecting...")
@@ -95,9 +135,11 @@ class Sender:
             return
 
         # Establish TCP socket connection
+        tcp_socket = None
         try:
             is_directory = os.path.isdir(filepath)
             tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            optimize_tcp_socket(tcp_socket)
             tcp_socket.connect((receiver_ip, receiver_tcp_port))
 
             if is_directory:
@@ -143,10 +185,9 @@ class Sender:
                 self.on_status(f"Sending folder {foldername} ({format_size(total_bytes)}, {len(entries)} items)...")
 
                 total_sent_bytes = 0
-                start_time = time.time()
-                last_update_time = start_time
-                last_sent_bytes = 0
-                peak_bytes_sec = 0.0
+                tracker = TransferMetricsTracker()
+                self.tracker = tracker
+                last_ui_update = 0.0
 
                 # Iterate and stream directory entries
                 for entry_type, rel_path, abs_path, fsize in entries:
@@ -162,9 +203,13 @@ class Sender:
                     if entry_type == 'F':
                         tcp_socket.sendall(struct.pack('>Q', fsize))
 
-                        with open(abs_path, 'rb') as f:
+                        with open(abs_path, 'rb', buffering=config.DISK_BUFFER_SIZE) as f:
                             sent_for_file = 0
                             while sent_for_file < fsize and self.running:
+                                if not self.pause_event.wait(timeout=0.2):
+                                    continue
+                                if not self.running:
+                                    break
                                 chunk = f.read(min(config.CHUNK_SIZE_P2P, fsize - sent_for_file))
                                 if not chunk:
                                     break
@@ -174,48 +219,35 @@ class Sender:
                                 total_sent_bytes += len_chunk
 
                                 current_time = time.time()
-                                if current_time - last_update_time > 0.1:
-                                    percent = (total_sent_bytes / total_bytes * 100) if total_bytes > 0 else 100.0
-                                    elapsed_interval = current_time - last_update_time
-                                    total_elapsed = max(current_time - start_time, 0.001)
-
-                                    bytes_diff = total_sent_bytes - last_sent_bytes
-                                    cur_bytes_sec = bytes_diff / elapsed_interval if elapsed_interval > 0 else 0
-                                    avg_bytes_sec = total_sent_bytes / total_elapsed if total_elapsed > 0 else 0
-                                    peak_bytes_sec = max(peak_bytes_sec, cur_bytes_sec)
-
-                                    remaining_bytes = max(0, total_bytes - total_sent_bytes)
-                                    eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
-                                    eta_str = format_time(eta_sec)
-                                    elapsed_str = format_time(total_elapsed)
-
-                                    cur_speed_str = f"{format_size(cur_bytes_sec)}/s"
-                                    avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
-                                    peak_speed_str = f"{format_size(peak_bytes_sec)}/s"
-                                    size_info_str = f"{format_size(total_sent_bytes)} / {format_size(total_bytes)}"
-
-                                    self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
-                                    last_update_time = current_time
-                                    last_sent_bytes = total_sent_bytes
+                                if current_time - last_ui_update > 0.1:
+                                    metrics = tracker.update(total_sent_bytes, total_bytes)
+                                    self.on_progress(
+                                        metrics["percent"],
+                                        metrics["cur_speed_str"],
+                                        metrics["avg_speed_str"],
+                                        metrics["peak_speed_str"],
+                                        metrics["size_info_str"],
+                                        metrics["eta_str"],
+                                        metrics["elapsed_str"]
+                                    )
+                                    last_ui_update = current_time
 
                 if self.running:
-                    total_elapsed = max(time.time() - start_time, 0.001)
-                    final_avg = (total_sent_bytes / total_elapsed) if total_elapsed > 0 else 0
-                    elapsed_str = format_time(total_elapsed)
+                    final_m = tracker.get_final_metrics(total_bytes)
                     self.on_progress(
-                        100.0, 
-                        "Done", 
-                        f"{format_size(final_avg)}/s", 
-                        f"{format_size(peak_bytes_sec)}/s", 
-                        f"{format_size(total_sent_bytes)} / {format_size(total_bytes)}",
-                        "0s",
-                        elapsed_str
+                        final_m["percent"], 
+                        final_m["cur_speed_str"], 
+                        final_m["avg_speed_str"], 
+                        final_m["peak_speed_str"], 
+                        final_m["size_info_str"],
+                        final_m["eta_str"],
+                        final_m["elapsed_str"]
                     )
                     self.on_status("Folder transfer complete!")
-                    self.on_complete(True)
+                    self.notify_complete(True, None)
                 else:
                     self.on_status("Transfer canceled.")
-                    self.on_complete(False)
+                    self.notify_complete(False, "CANCELED")
 
             else:
                 # Single File Transfer Mode
@@ -231,16 +263,19 @@ class Sender:
 
                 tcp_socket.sendall(struct.pack('>Q', file_size))
 
-                self.on_status(f"Sending {filename} ({format_size(file_size)})...")
+                self.on_status(f"Sending payload: {filename} ({format_size(file_size)})...")
 
                 sent_bytes = 0
-                start_time = time.time()
-                last_update_time = start_time
-                last_sent_bytes = 0
-                peak_bytes_sec = 0.0
+                tracker = TransferMetricsTracker()
+                self.tracker = tracker
+                last_ui_update = 0.0
 
-                with open(filepath, 'rb') as f:
+                with open(filepath, 'rb', buffering=config.DISK_BUFFER_SIZE) as f:
                     while sent_bytes < file_size and self.running:
+                        if not self.pause_event.wait(timeout=0.2):
+                            continue
+                        if not self.running:
+                            break
                         chunk = f.read(config.CHUNK_SIZE_P2P)
                         if not chunk:
                             break
@@ -248,55 +283,47 @@ class Sender:
                         sent_bytes += len(chunk)
 
                         current_time = time.time()
-                        if current_time - last_update_time > 0.1:
-                            percent = (sent_bytes / file_size * 100) if file_size > 0 else 100.0
-                            elapsed_interval = current_time - last_update_time
-                            total_elapsed = max(current_time - start_time, 0.001)
+                        if current_time - last_ui_update > 0.1:
+                            metrics = tracker.update(sent_bytes, file_size)
+                            self.on_progress(
+                                metrics["percent"],
+                                metrics["cur_speed_str"],
+                                metrics["avg_speed_str"],
+                                metrics["peak_speed_str"],
+                                metrics["size_info_str"],
+                                metrics["eta_str"],
+                                metrics["elapsed_str"]
+                            )
+                            last_ui_update = current_time
 
-                            bytes_diff = sent_bytes - last_sent_bytes
-                            cur_bytes_sec = bytes_diff / elapsed_interval if elapsed_interval > 0 else 0
-                            avg_bytes_sec = sent_bytes / total_elapsed if total_elapsed > 0 else 0
-                            peak_bytes_sec = max(peak_bytes_sec, cur_bytes_sec)
-
-                            remaining_bytes = max(0, file_size - sent_bytes)
-                            eta_sec = (remaining_bytes / cur_bytes_sec) if cur_bytes_sec > 0 else None
-                            eta_str = format_time(eta_sec)
-                            elapsed_str = format_time(total_elapsed)
-
-                            cur_speed_str = f"{format_size(cur_bytes_sec)}/s"
-                            avg_speed_str = f"{format_size(avg_bytes_sec)}/s"
-                            peak_speed_str = f"{format_size(peak_bytes_sec)}/s"
-                            size_info_str = f"{format_size(sent_bytes)} / {format_size(file_size)}"
-
-                            self.on_progress(percent, cur_speed_str, avg_speed_str, peak_speed_str, size_info_str, eta_str, elapsed_str)
-                            last_update_time = current_time
-                            last_sent_bytes = sent_bytes
-
-                if sent_bytes == file_size:
-                    total_elapsed = max(time.time() - start_time, 0.001)
-                    final_avg = (sent_bytes / total_elapsed) if total_elapsed > 0 else 0
-                    elapsed_str = format_time(total_elapsed)
+                if sent_bytes == file_size and self.running:
+                    final_m = tracker.get_final_metrics(file_size)
                     self.on_progress(
-                        100.0, 
-                        "Done", 
-                        f"{format_size(final_avg)}/s", 
-                        f"{format_size(peak_bytes_sec)}/s", 
-                        f"{format_size(sent_bytes)} / {format_size(file_size)}",
-                        "0s",
-                        elapsed_str
+                        final_m["percent"], 
+                        final_m["cur_speed_str"], 
+                        final_m["avg_speed_str"], 
+                        final_m["peak_speed_str"], 
+                        final_m["size_info_str"],
+                        final_m["eta_str"],
+                        final_m["elapsed_str"]
                     )
-                    self.on_status("Transfer complete!")
-                    self.on_complete(True)
+                    self.on_status("Payload transfer complete!")
+                    self.notify_complete(True, None)
                 else:
                     self.on_status("Transfer canceled.")
-                    self.on_complete(False)
+                    self.notify_complete(False, "CANCELED")
 
         except Exception as e:
             self.on_status(f"Transfer Error: {e}")
-            self.on_complete(False)
+            self.notify_complete(False, str(e))
         finally:
-            try:
-                tcp_socket.close()
-            except Exception:
-                pass
+            if tcp_socket:
+                try:
+                    tcp_socket.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
+                try:
+                    tcp_socket.close()
+                except Exception:
+                    pass
 
