@@ -50,12 +50,12 @@ jobs:
     - name: Build Executable with PyInstaller (Windows)
       if: runner.os == 'Windows'
       run: |
-        python -m PyInstaller --noconfirm --onefile --windowed --icon=assets/logo.ico --add-data "assets;assets" --name DropIt main.py
+        flet pack main.py --icon=assets/logo.ico --add-data "assets;assets" --name DropIt
 
     - name: Build Executable with PyInstaller (macOS / Linux)
       if: runner.os != 'Windows'
       run: |
-        python -m PyInstaller --noconfirm --onefile --windowed --add-data "assets:assets" --name ${{ matrix.artifact_name }} main.py
+        flet pack main.py --add-data "assets:assets" --name ${{ matrix.artifact_name }}
 
     - name: Zip macOS App Bundle
       if: runner.os == 'macOS'
