@@ -71,7 +71,8 @@ jobs:
 
     - name: Upload Release Asset to GitHub Release
       if: github.event_name == 'release'
-      uses: softprops/action-gh-release@v2
-      with:
-        files: ${{ matrix.asset_path }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release upload ${{ github.event.release.tag_name }} ${{ matrix.asset_path }} --clobber
 
