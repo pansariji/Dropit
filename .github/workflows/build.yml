@@ -17,14 +17,14 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: DropIt-Windows.exe
-            asset_path: dist/DropIt.exe
+            artifact_name: DropIt-Windows
+            executable_name: DropIt.exe
           - os: macos-latest
             artifact_name: DropIt-macOS
-            asset_path: dist/DropIt-macOS.zip
+            executable_name: DropIt-macOS.app
           - os: ubuntu-latest
             artifact_name: DropIt-Linux
-            asset_path: dist/DropIt-Linux
+            executable_name: DropIt-Linux
 
     steps:
     - name: Checkout Code
@@ -57,22 +57,21 @@ jobs:
       run: |
         flet pack main.py --add-data "assets:assets" --name ${{ matrix.artifact_name }}
 
-    - name: Zip macOS App Bundle
-      if: runner.os == 'macOS'
+    - name: Zip Executables
       run: |
         cd dist
-        zip -r ${{ matrix.artifact_name }}.zip ${{ matrix.artifact_name }}.app
+        python -m zipfile -c ${{ matrix.artifact_name }}.zip ${{ matrix.executable_name }}
 
     - name: Upload Executable Artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: ${{ matrix.asset_path }}
+        path: dist/${{ matrix.artifact_name }}.zip
 
     - name: Upload Release Asset to GitHub Release
       if: github.event_name == 'release'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh release upload ${{ github.event.release.tag_name }} ${{ matrix.asset_path }} --clobber
+        gh release upload ${{ github.event.release.tag_name }} dist/${{ matrix.artifact_name }}.zip --clobber
 
